@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#10141d" />
+    <title>远征原型 · 即时战斗</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div><span class="eyebrow">WEB COMBAT PROTOTYPE</span><h1>边境远征</h1></div>
+        <div class="objective"><span class="pulse"></span><span id="status">清理房间中的敌人</span></div>
+      </header>
+      <main><div id="game"></div></main>
+      <footer class="controls">
+        <div class="control-group"><span class="key">W A S D</span><span>移动</span></div>
+        <div class="control-group"><span class="key mouse">鼠标</span><span>瞄准 · 按住攻击</span></div>
+        <div class="control-group"><span class="key accent">空格</span><span>疾风斩</span></div>
+        <div class="hud"><span>生命</span><div class="health-track"><div id="health" class="health-fill"></div></div><span id="health-label">100 / 100</span></div>
+        <div class="pet-label"><i></i> 灵狐自动追击</div>
+      </footer>
+      <div id="overlay" class="overlay hidden"><div class="modal"><span class="eyebrow">EXPEDITION REPORT</span><h2 id="result-title">房间清理完成</h2><p id="result-text">准备进入下一间房。</p><button id="continue">继续远征 <span>→</span></button></div></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

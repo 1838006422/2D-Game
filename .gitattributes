@@ -1,0 +1,19 @@
+# 统一换行符，避免跨平台协作出现整文件 diff
+* text=auto eol=lf
+
+# 二进制资源不做换行转换与 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.mp3 binary
+*.ogg binary
+*.wav binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+
+# 锁文件不参与 diff 统计
+package-lock.json -diff linguist-generated=true
