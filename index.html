@@ -9,14 +9,14 @@
   <body>
     <div id="app">
       <section id="hub-screen" class="hub-screen">
-        <div class="hub-topbar"><div><span class="eyebrow">SAFE ZONE · OUTPOST 01</span><h1>边境营地</h1></div><div class="camp-status"><i></i>安全区域</div></div>
+        <div class="hub-topbar"><div><span class="eyebrow">SAFE ZONE · OUTPOST 01</span><h1>边境营地</h1></div><div class="hub-top-actions"><button id="open-character-page" class="profile-button">人物信息</button><div class="camp-status"><i></i>安全区域</div></div></div>
         <div class="camp-scene">
           <div class="camp-glow"></div><div class="camp-moon"></div><div class="camp-ridge ridge-back"></div><div class="camp-ridge ridge-front"></div>
           <div class="campfire"><span></span><i></i><b></b></div>
-          <div class="camp-caption"><span class="eyebrow">YOUR EXPEDITION STARTS HERE</span><h2>整备好，再出发</h2><p>这里是远征的安全区。选择武器后进入边境哨站，清理敌人并继续深入。</p></div>
+          <div class="camp-caption"><span class="eyebrow">YOUR EXPEDITION STARTS HERE</span><h2>整备好，再出发</h2><p>这里是安全营地。整备后进入边境世界，在随机生成的地貌中自由探索、发现遗迹与野外生物。</p></div>
         </div>
         <div class="hub-panel">
-          <div class="hub-section-title"><div><span class="eyebrow">LOADOUT</span><h3>选择出发武器</h3></div><span class="muted">副本中仍可按 1 / 2 / 3 切换</span></div>
+          <div class="hub-section-title"><div><span class="eyebrow">LOADOUT</span><h3>选择出发武器</h3></div><span class="muted">探索中可按 1 / 2 / 3 切换</span></div>
           <div class="weapon-choices">
             <button class="weapon-card selected" data-weapon="sword"><span class="weapon-icon sword-icon">⚔</span><span><strong>单手剑</strong><small>快速近战 · 连续挥砍</small></span><span class="choice-mark">✓</span></button>
             <button class="weapon-card" data-weapon="spear"><span class="weapon-icon spear-icon">↗</span><span><strong>长枪</strong><small>长距离 · 直线穿刺</small></span><span class="choice-mark">✓</span></button>
@@ -32,11 +32,11 @@
             </div>
           </div>
           <div class="hub-bottom">
-            <div class="camp-services"><span>营地设施</span><b>训练场</b><b>宠物休息处</b><small>更多整备功能将在后续加入</small></div>
+            <div class="camp-services"><span>营地设施</span><b>训练场</b><b>宠物休息处</b><small>军需官可管理装备并使用首领晶片强化</small></div>
             <div class="expedition-actions">
-              <div class="progress-summary"><span class="eyebrow">EXPEDITION PROGRESS</span><strong id="progress-summary">已解锁至 1-1</strong></div>
-              <div class="progress-row"><button id="embark" class="embark-button">继续远征 <span id="continue-stage-label">1-1 →</span></button><select id="stage-select" aria-label="选择已解锁关卡"></select><button id="start-selected-stage" class="stage-button">从此关开始</button></div>
-              <button id="new-expedition" class="new-run-button">从头开始 · 1-1</button>
+              <div class="progress-summary"><span class="eyebrow">WORLD EXPLORATION</span><strong id="world-summary">尚未生成世界</strong></div>
+              <div class="progress-row"><button id="embark" class="embark-button">继续探索 <span id="continue-stage-label">进入世界 →</span></button></div>
+              <button id="new-expedition" class="new-run-button">生成新世界</button>
             </div>
           </div>
         </div>
@@ -46,11 +46,18 @@
             <h2 id="dialog-name">军需官</h2><p id="dialog-text"></p><div id="dialog-options" class="dialog-options"></div>
           </section>
         </div>
+        <div id="character-page" class="character-overlay hidden">
+          <section class="character-panel"><header class="character-header"><div><span class="eyebrow">CHARACTER PROFILE</span><h2>人物信息</h2></div><button id="close-character-page" class="character-close" aria-label="关闭">×</button></header>
+            <div id="character-summary" class="character-summary"></div>
+            <nav class="character-tabs"><button data-character-tab="overview" class="active">人物预览</button><button data-character-tab="skills">人物技能</button><button data-character-tab="equipment">装备管理</button></nav>
+            <div id="character-content" class="character-content"></div>
+          </section>
+        </div>
       </section>
       <div id="combat-screen" class="hidden">
       <header class="topbar">
         <div><span class="eyebrow">WEB COMBAT PROTOTYPE</span><h1>边境远征</h1></div>
-        <div class="objective"><span class="pulse"></span><span id="status">清理房间中的敌人</span></div>
+        <div class="objective"><span class="pulse"></span><span id="status">清理房间中的敌人</span><button id="leave-world" class="leave-world-button">返回营地</button></div>
       </header>
       <main><div id="game"></div></main>
       <footer class="controls">
@@ -58,10 +65,12 @@
         <div class="control-group"><span class="key mouse">鼠标</span><span>瞄准 · 按住攻击</span></div>
         <div class="control-group"><span class="key weapon-keys">1 剑&nbsp; 2 枪&nbsp; 3 杖</span><span>切换武器</span></div>
         <div class="control-group"><span class="key accent">空格</span><span>冲刺</span></div>
+        <div class="control-group"><span class="key accent">E</span><span>互动 / 查看路线</span></div>
         <div class="control-group"><span class="key skill-key">Q</span><span>风刃</span></div>
-        <div class="character-skills" aria-label="人物技能"><span id="active-skill-state">Q 风刃 可用</span><span id="passive-skill-state">被动 迅捷步伐</span><span id="auto-skill-state">自动 追击弹 待命</span></div>
+        <div class="character-skills" aria-label="人物技能"><span id="active-skill-state">Q 风刃 可用</span><span id="passive-skill-state">被动 迅捷步伐</span><span id="auto-skill-state">自动 追击弹 待命</span><span id="buff-state" class="hidden"></span></div>
         <div id="weapon-label" class="weapon-label">当前武器：单手剑</div>
-        <div class="hud"><span>生命</span><div class="health-track"><div id="health" class="health-fill"></div></div><span id="health-label">100 / 100</span></div>
+        <div class="progress-hud" aria-label="角色等级与经验"><strong id="character-level">Lv. 1</strong><div class="xp-track"><i id="character-xp-fill"></i></div><small id="character-xp-label">0 / 100 XP</small></div>
+        <div class="hud"><span id="core-count" class="core-count">晶片 0</span><span>生命</span><div class="health-track"><div id="health" class="health-fill"></div></div><span id="health-label">100 / 100</span></div>
         <div class="pet-skills" aria-label="灵狐当前技能"><span class="pet-skills-title"><i></i>灵狐</span><div id="pet-skills-active" class="pet-skills-active"></div><span id="pet-rescue-state" title="生命降至一半以下时自动治疗 14 点，冷却 12 秒">守护灵息 可用</span></div>
       </footer>
       <div id="overlay" class="overlay hidden"><div class="modal"><span class="eyebrow">EXPEDITION REPORT</span><h2 id="result-title">房间清理完成</h2><p id="result-text">准备进入下一间房。</p><div id="route-options" class="route-options hidden"></div><div class="modal-actions"><button id="continue" class="hidden">继续深入 <span>→</span></button><button id="return-hub" class="secondary-button">返回营地</button></div></div></div>
