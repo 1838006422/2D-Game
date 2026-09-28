@@ -1,13 +1,59 @@
 import Phaser from 'phaser';
 import './style.css';
-import { biomeColor, biomeName, createWorldSeed, loadWorldSave, saveWorldSave, TILE_SIZE, WorldMapData, WORLD_HEIGHT, WORLD_WIDTH } from './game/world/WorldMapData';
+import { BUILD_MATERIALS, biomeColor, biomeName, createWorldSeed, HEIGHT_STEP, loadWorldSave, MaterialId, materialName, oreName, Poi, saveWorldSave, TILE_HEIGHT, TILE_SIZE, WorldMapData, WORLD_HEIGHT, WORLD_ROWS, WORLD_WIDTH } from './game/world/WorldMapData';
 import { WorldMapRenderer } from './game/world/WorldMapRenderer';
+import { poiColor, poiLabel, WorldPoiLayer } from './game/world/WorldPoiLayer';
+import { actorTexture } from './game/world/WorldTiles';
+import { BEST_KEY, DefenseScene } from './game/defense/DefenseScene';
+import { BOONS, BoonId } from './game/defense/DefenseConfig';
+import { loadTileManifest, queueTileImages, registerTiles } from './game/world/WorldTiles';
 
 const W = 960;
 const H = 540;
 const WORLD_W = WORLD_WIDTH;
 const WORLD_H = WORLD_HEIGHT;
 const COLORS = { floor: 0x171e28, grid: 0x202a37, wall: 0x354153, player: 0x91e1c4, pet: 0xa9e9dc, enemy: 0xe77d70, gold: 0xffc77d, ink: 0x10151d };
+const MATERIAL_KEY = 'border-expedition-materials';
+const DIG_REACH = 110;
+const DIG_COOLDOWN = 260;
+type MaterialBag = Partial<Record<MaterialId, number>>;
+const MATERIAL_COLORS: Record<MaterialId, string> = {
+  soil: '#c0956a', stone: '#c3c6ca', sand: '#ddc98f', snow: '#e2eef5',
+  wood: '#b58a5c', copper: '#e8a765', iron: '#d7dbe0', gold: '#ffd977', crystal: '#c3a6ff',
+};
+// Smelting turns mined ore into the boss cores used for gear upgrades, which
+// closes the loop between digging in the world and powering up in the hub.
+const SMELT_RECIPES: { ore: MaterialId; amount: number }[] = [
+  { ore: 'copper', amount: 4 }, { ore: 'iron', amount: 3 }, { ore: 'gold', amount: 2 }, { ore: 'crystal', amount: 2 },
+];
+// Each guardian demands a combat rating, which is what turns gear, upgrades and
+// levels into a real requirement instead of optional grinding.
+const BOSS_RATING = [8, 24, 40];
+
+// localStorage is synchronous, so anything the game loop reads every frame is
+// mirrored in memory; the store is only touched when a value actually changes.
+let materialCache: MaterialBag | null = null;
+
+function getMaterials(): MaterialBag {
+  if (materialCache) return materialCache;
+  try {
+    const value = JSON.parse(localStorage.getItem(MATERIAL_KEY) ?? 'null') as MaterialBag | null;
+    materialCache = value && typeof value === 'object' ? value : {};
+  } catch { materialCache = { /* Start with an empty bag if saved materials are unavailable. */ }; }
+  return materialCache;
+}
+
+function saveMaterials(bag: MaterialBag) {
+  materialCache = bag;
+  try { localStorage.setItem(MATERIAL_KEY, JSON.stringify(bag)); } catch { /* Materials stay usable for this visit. */ }
+}
+
+function addMaterial(material: MaterialId, amount: number) {
+  const bag = getMaterials();
+  const next = Math.max(0, (bag[material] ?? 0) + amount);
+  if (next === 0) delete bag[material]; else bag[material] = next;
+  saveMaterials(bag);
+}
 type PetSkillId = 'mark' | 'breath' | 'shock' | 'ferocity' | 'scavenger';
 type AutoSkillId = 'hunter_shot' | 'battle_focus' | 'shockwave';
 const PLAYER_PASSIVE_KEY = 'border-expedition-player-passive';
@@ -44,19 +90,25 @@ type EquipmentState = { items: EquipmentItem[]; equipped: { weapon: string | nul
 type CharacterAttributes = { power: number; focus: number; agility: number };
 type CharacterProgress = { level: number; xp: number; statPoints: number; attributes: CharacterAttributes };
 
+let progressCache: CharacterProgress | null = null;
+
 function getCharacterProgress(): CharacterProgress {
+  if (progressCache) return progressCache;
   try {
     const value = JSON.parse(localStorage.getItem(CHARACTER_PROGRESS_KEY) ?? 'null') as Partial<CharacterProgress> | null;
     if (value && Number.isInteger(value.level) && Number.isInteger(value.xp) && Number.isInteger(value.statPoints) && value.attributes) {
-      return { level: Math.max(1, value.level!), xp: Math.max(0, value.xp!), statPoints: Math.max(0, value.statPoints!), attributes: {
+      progressCache = { level: Math.max(1, value.level!), xp: Math.max(0, value.xp!), statPoints: Math.max(0, value.statPoints!), attributes: {
         power: Math.max(0, Number(value.attributes.power) || 0), focus: Math.max(0, Number(value.attributes.focus) || 0), agility: Math.max(0, Number(value.attributes.agility) || 0),
       } };
+      return progressCache;
     }
   } catch { /* Use the level-one defaults when saved character data is invalid. */ }
-  return { level: 1, xp: 0, statPoints: 0, attributes: { power: 0, focus: 0, agility: 0 } };
+  progressCache = { level: 1, xp: 0, statPoints: 0, attributes: { power: 0, focus: 0, agility: 0 } };
+  return progressCache;
 }
 
 function saveCharacterProgress(progress: CharacterProgress) {
+  progressCache = progress;
   try { localStorage.setItem(CHARACTER_PROGRESS_KEY, JSON.stringify(progress)); } catch { /* Keep progression active for this visit. */ }
 }
 
@@ -235,11 +287,22 @@ class CombatScene extends Phaser.Scene {
   private terrain!: Phaser.Physics.Arcade.StaticGroup;
   private worldData?: WorldMapData;
   private worldRenderer?: WorldMapRenderer;
+  private poiLayer?: WorldPoiLayer;
+  private nearPoi?: Poi;
+  private bossPoiId?: number;
   private wildernessSpawnTimer = 3_000;
+  private digTimer = 0;
+  private materialText!: Phaser.GameObjects.Text;
 
   constructor() { super('combat'); }
 
+  preload() {
+    // Tile art is optional; without a manifest the world keeps its vector look.
+    queueTileImages(this);
+  }
+
   create() {
+    registerTiles(this);
     this.game.events.on('world:begin', this.beginWorld, this);
     this.game.events.on('world:resume', this.resumeWorld, this);
     this.game.events.on('world:leave', this.leaveWorld, this);
@@ -261,8 +324,12 @@ class CombatScene extends Phaser.Scene {
     this.addWall(WORLD_W / 2, 28, WORLD_W, 56); this.addWall(WORLD_W / 2, WORLD_H - 28, WORLD_W, 56);
     this.addWall(28, WORLD_H / 2, 56, WORLD_H); this.addWall(WORLD_W - 28, WORLD_H / 2, 56, WORLD_H);
     this.terrain = this.physics.add.staticGroup();
-    this.player = this.physics.add.sprite(WORLD_W / 2, WORLD_H / 2, 'player').setDepth(3).setCircle(14).setCollideWorldBounds(true);
-    this.pet = this.physics.add.sprite(WORLD_W / 2 - 36, WORLD_H / 2 + 22, 'pet').setDepth(3).setCircle(9);
+    const playerArt = actorTexture('player');
+    this.player = this.physics.add.sprite(WORLD_W / 2, WORLD_H / 2, playerArt ?? 'player').setDepth(3).setCollideWorldBounds(true);
+    this.actorCircle(this.player, 14, Boolean(playerArt));
+    const petArt = actorTexture('pet');
+    this.pet = this.physics.add.sprite(WORLD_W / 2 - 36, WORLD_H / 2 + 22, petArt ?? 'pet').setDepth(3);
+    this.actorCircle(this.pet, 9, Boolean(petArt));
     this.enemies = this.physics.add.group({ runChildUpdate: false });
     this.skillBookDrops = this.physics.add.group();
     this.rewardDrops = this.physics.add.group();
@@ -278,9 +345,11 @@ class CombatScene extends Phaser.Scene {
     this.physics.add.overlap(this.player, this.skillBookDrops, (_p, book) => this.pickUpSkillBook(book as Phaser.GameObjects.Arc));
     this.physics.add.overlap(this.player, this.rewardDrops, (_p, reward) => this.pickUpCore(reward as Phaser.GameObjects.Arc));
     this.physics.add.overlap(this.player, this.gearDrops, (_p, gear) => this.pickUpGear(gear as Phaser.GameObjects.Arc));
-    this.keys = this.input.keyboard!.addKeys('W,A,S,D,Q,E,SPACE,ONE,TWO,THREE') as Record<string, Phaser.Input.Keyboard.Key>;
+    this.keys = this.input.keyboard!.addKeys('W,A,S,D,Q,E,R,SPACE,ONE,TWO,THREE') as Record<string, Phaser.Input.Keyboard.Key>;
     this.cursors = this.input.keyboard!.createCursorKeys();
-    this.input.on('pointerdown', () => { this.attackHeld = true; });
+    // The right button digs, so the browser menu has to stay out of the way.
+    this.input.mouse?.disableContextMenu();
+    this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => { if (!pointer.rightButtonDown()) this.attackHeld = true; });
     this.input.on('pointerup', () => { this.attackHeld = false; });
     this.input.on('gameout', () => { this.attackHeld = false; });
     this.playerHpBar = this.add.rectangle(0, 0, 36, 4, 0x83d7b1).setDepth(5).setOrigin(.5, .5);
@@ -289,7 +358,11 @@ class CombatScene extends Phaser.Scene {
     this.dashText = this.add.text(W - 54, 48, '', { fontFamily: 'DM Mono, monospace', fontSize: '11px', color: '#ffc77d' }).setOrigin(1, 0).setDepth(8).setScrollFactor(0);
     this.mapLayer = this.add.container(W - 238, 76).setDepth(8).setScrollFactor(0);
     this.interactionHint = this.add.text(W / 2, H - 73, '', { fontFamily: 'Microsoft YaHei,sans-serif', fontSize: '13px', color: '#fff0c2', backgroundColor: '#10151ddd', padding: { x: 13, y: 8 } }).setOrigin(.5).setDepth(9).setScrollFactor(0).setVisible(false);
-    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H).startFollow(this.player, true, .12, .12);
+    this.materialText = this.add.text(16, H - 30, '', { fontFamily: 'Microsoft YaHei,sans-serif', fontSize: '11px', color: '#cbd5e1', backgroundColor: '#10151dcc', padding: { x: 8, y: 5 } }).setDepth(8).setScrollFactor(0);
+    this.updateMaterialHud();
+    // Snapping the camera to whole pixels stops sub-pixel sampling from opening
+    // hairline gaps between tiles and between chunk textures.
+    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H).startFollow(this.player, true, .12, .12).setRoundPixels(true);
     this.updateCoreHud();
     this.updateCharacterProgressHud();
     this.setWeapon(this.weapon);
@@ -313,12 +386,16 @@ class CombatScene extends Phaser.Scene {
 
   private beginWorld() {
     this.clearExpeditionEntities();
-    this.worldData = new WorldMapData(createWorldSeed());
+    const data = new WorldMapData(createWorldSeed());
+    this.worldData = data;
     this.worldMiniMapOrigin = undefined;
     this.room = 1; this.dungeon = generateDungeon(1); this.hp = 100; this.kills = 0;
     this.restBuffUntil = 0; this.wildernessSpawnTimer = 3_000;
     this.resetCombatState();
-    this.activateWorld(WORLD_W / 2, WORLD_H / 2);
+    // The continent is crossed left to right, so every run starts on the home meadow.
+    const spawnTile = data.findSpawnTile();
+    const spawn = data.surfaceWorld(spawnTile.x, spawnTile.y);
+    this.activateWorld(spawn.x, spawn.y);
     this.saveCurrentCheckpoint();
   }
 
@@ -342,18 +419,25 @@ class CombatScene extends Phaser.Scene {
     this.worldRenderer?.destroy();
     this.worldRenderer = new WorldMapRenderer(this, this.worldData!, this.terrain);
     this.worldRenderer.update(this.player.x, this.player.y);
+    this.poiLayer?.destroy();
+    this.poiLayer = new WorldPoiLayer(this, this.worldData!);
+    this.poiLayer.build();
     const safeSpawn = this.findOpenAt(this.player.x, this.player.y, 44);
     this.player.setPosition(safeSpawn.x, safeSpawn.y).setVelocity(0, 0);
     this.pet.setPosition(safeSpawn.x - 36, safeSpawn.y + 22).setVelocity(0, 0);
     this.worldRenderer.update(safeSpawn.x, safeSpawn.y);
     this.roomCombatActive = false; this.lootPhase = false;
     const status = document.querySelector<HTMLElement>('#status');
-    if (status) status.textContent = '自由探索中 · 未探索区域被迷雾遮挡';
+    if (status) status.textContent = '探索中 · 右键挖掘方块 · R 放置方块';
     this.updateLabels(); this.drawMiniMap(); this.updateHealthHud(); this.scene.resume(); this.scale.refresh();
   }
 
   private leaveWorld() {
     if (this.worldData) this.saveCurrentCheckpoint();
+    // Drop the streamed chunks and landmarks so nothing renders while hidden.
+    this.worldRenderer?.destroy(); this.worldRenderer = undefined;
+    this.poiLayer?.destroy(); this.poiLayer = undefined;
+    this.nearPoi = undefined;
     this.scene.pause();
   }
 
@@ -611,13 +695,14 @@ class CombatScene extends Phaser.Scene {
     this.tweens.add({ targets: label, y: y - 68, alpha: 0, duration: 850, onComplete: () => label.destroy() });
   }
 
-  private spawnBoss() {
-    const tier = Math.floor((this.room - 1) / 3);
-    const maxHp = 14 + tier * 4;
-    const spawn = this.findOpenEnemySpawn(0, 360, 64);
-    const enemy = this.physics.add.sprite(spawn.x, spawn.y, 'enemy').setDepth(2).setCircle(23).setScale(1.85)
-      .setTint(0xb84f62).setData({ kind: 'boss' as EnemyKind, tint: 0xb84f62, hp: maxHp, maxHp, hitAt: 0, moveSpeed: 34 + Math.min(18, tier * 3), aiState: 'approach', nextSpecialAt: this.time.now + Math.max(1150, 1800 - tier * 90), specialCount: 0, touchDamage: 8 + Math.floor(tier / 2) });
-    enemy.setCollideWorldBounds(true); this.enemies.add(enemy);
+  /** Spawns a guardian, optionally at a world position (used by boss dens). */
+  private spawnBoss(atX?: number, atY?: number, tier = Math.floor((this.room - 1) / 3)) {
+    const maxHp = 20 + tier * 10;
+    const spawn = atX !== undefined && atY !== undefined ? { x: atX, y: atY } : this.findOpenEnemySpawn(0, 360, 64);
+    const bossArt = actorTexture('boss');
+    const enemy = this.physics.add.sprite(spawn.x, spawn.y, bossArt ?? 'enemy').setDepth(2).setScale(1.85)
+      .setTint(bossArt ? 0xffffff : 0xb84f62).setData({ kind: 'boss' as EnemyKind, tint: 0xb84f62, hp: maxHp, maxHp, hitAt: 0, moveSpeed: 34 + Math.min(18, tier * 3), aiState: 'approach', nextSpecialAt: this.time.now + Math.max(1150, 1800 - tier * 90), specialCount: 0, touchDamage: 8 + Math.floor(tier / 2) });
+    enemy.setCollideWorldBounds(true); this.actorCircle(enemy, 23, Boolean(bossArt)); this.enemies.add(enemy);
     const bar = this.add.rectangle(enemy.x, enemy.y - 34, 52, 5, 0x9b3c50).setDepth(3);
     enemy.setData('bar', bar);
     this.kills = 0; this.updateLabels();
@@ -673,6 +758,15 @@ class CombatScene extends Phaser.Scene {
         }
       }
       const origin = this.worldMiniMapOrigin!;
+      // Discovered landmarks show up as coloured dots on the mini-map.
+      const mapStartX = origin.x - Math.floor(columns / 2);
+      const mapStartY = origin.y - Math.floor(rows / 2);
+      this.worldData.getPois().forEach((poi) => {
+        if (!poi.discovered) return;
+        const col = poi.tileX - mapStartX; const row = poi.tileY - mapStartY;
+        if (col < 0 || row < 0 || col >= columns || row >= rows) return;
+        this.worldMiniMapCells[row * columns + col].setFillStyle(poiColor(poi.kind), poi.cleared ? .45 : 1);
+      });
       const markerX = sx + (center.x - origin.x + Math.floor(columns / 2)) * cell + cell / 2;
       const markerY = sy + (center.y - origin.y + Math.floor(rows / 2)) * cell + cell / 2;
       this.worldMiniMapMarker?.setPosition(markerX, markerY);
@@ -767,7 +861,10 @@ class CombatScene extends Phaser.Scene {
       Phaser.Math.Clamp(this.player.y + Math.sin(angle) * radius, 120, WORLD_H - 120), 72,
     );
     const biome = this.worldData.biomeAtWorld(anchor.x, anchor.y);
-    const kind: Exclude<EnemyKind, 'boss'> = biome === 'ruins' ? 'caster' : biome === 'sand' ? 'brute' : biome === 'forest' ? 'stalker' : Phaser.Utils.Array.GetRandom(['stalker', 'brute']);
+    const kind: Exclude<EnemyKind, 'boss'> = biome === 'ruins' || biome === 'swamp' ? 'caster'
+      : biome === 'sand' || biome === 'highland' ? 'brute'
+      : biome === 'forest' || biome === 'snow' ? 'stalker'
+      : Phaser.Utils.Array.GetRandom(['stalker', 'brute']);
     const count = Math.min(5 - this.enemies.countActive(), Phaser.Math.Between(1, 3));
     const offsets: [number, number][] = [[0, 0], [58, -28], [-54, 38]];
     for (let i = 0; i < count; i++) {
@@ -805,15 +902,17 @@ class CombatScene extends Phaser.Scene {
   }
 
   private spawnEnemy(kind: Exclude<EnemyKind, 'boss'>, x: number, y: number) {
-    const tier = Math.floor((this.room - 1) / 3);
+    const tier = this.wildernessTier();
     const stats = {
       stalker: { hp: 2 + Math.min(6, tier), speed: 66 + Math.min(18, tier * 3), color: 0xe77d70, scale: 1, damage: 6 + Math.floor(tier / 2), barY: 19 },
       brute: { hp: 4 + Math.min(12, tier * 2), speed: 34 + Math.min(12, tier * 2), color: 0xe79b5b, scale: 1.28, damage: 11 + tier, barY: 24 },
       caster: { hp: 2 + Math.min(6, tier), speed: 50 + Math.min(15, tier * 2), color: 0xb38bed, scale: 1.08, damage: 5 + Math.floor(tier / 2), barY: 21 },
     }[kind];
-    const enemy = this.physics.add.sprite(x, y, 'enemy').setDepth(2).setCircle(12).setScale(stats.scale)
-      .setTint(stats.color).setData({ kind, tint: stats.color, hp: stats.hp, maxHp: stats.hp, hitAt: 0, moveSpeed: stats.speed, touchDamage: stats.damage, castAt: this.time.now + Phaser.Math.Between(900, 1700) });
-    enemy.setCollideWorldBounds(true); this.enemies.add(enemy);
+    // Art actors keep their own colours, so only the placeholder circles get tinted.
+    const art = actorTexture(kind);
+    const enemy = this.physics.add.sprite(x, y, art ?? 'enemy').setDepth(2).setScale(stats.scale)
+      .setTint(art ? 0xffffff : stats.color).setData({ kind, tint: stats.color, hp: stats.hp, maxHp: stats.hp, hitAt: 0, moveSpeed: stats.speed, touchDamage: stats.damage, castAt: this.time.now + Phaser.Math.Between(900, 1700) });
+    enemy.setCollideWorldBounds(true); this.actorCircle(enemy, 12, Boolean(art)); this.enemies.add(enemy);
     const barColor = kind === 'caster' ? 0x664b79 : kind === 'brute' ? 0x795437 : 0x664b50;
     const bar = this.add.rectangle(x, y - stats.barY, kind === 'brute' ? 31 : 27, 3, barColor).setDepth(3);
     enemy.setData('bar', bar);
@@ -837,6 +936,216 @@ class CombatScene extends Phaser.Scene {
     return { x: anchorX, y: anchorY };
   }
 
+  /**
+   * Tiles are drawn lifted by their height, so the tile under the cursor is not
+   * simply `toTile`: the hit test walks from the far row towards the camera and
+   * keeps the last tile whose top face or side face covers the point.
+   */
+  private pickTile(worldX: number, worldY: number) {
+    const data = this.worldData!;
+    const start = data.toTile(worldX, worldY);
+    let hit = start;
+    for (let y = Math.max(0, start.y - 6); y <= Math.min(WORLD_ROWS - 1, start.y + 3); y++) {
+      const tile = data.tileAt(start.x, y);
+      const topY = y * TILE_HEIGHT - tile.height * HEIGHT_STEP;
+      const drop = Math.max(0, tile.height - data.heightAtTile(start.x, y + 1));
+      if (worldY >= topY && worldY <= topY + TILE_HEIGHT + drop * HEIGHT_STEP) hit = { x: start.x, y };
+    }
+    return hit;
+  }
+
+  private digAt(worldX: number, worldY: number) {
+    const data = this.worldData;
+    if (!data) return;
+    const tile = this.pickTile(worldX, worldY);
+    const surface = data.surfaceWorld(tile.x, tile.y);
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, surface.x, surface.y) > DIG_REACH) {
+      this.floatText(surface.x, surface.y, '超出范围', '#8795a8'); return;
+    }
+    const result = data.dig(tile.x, tile.y);
+    if (!result) {
+      const reason = data.tileAt(tile.x, tile.y).biome === 'water' ? '水面挖不动' : '已到基岩';
+      this.floatText(surface.x, surface.y, reason, '#8795a8'); return;
+    }
+    addMaterial(result.material, 1);
+    this.worldRenderer?.rebuildAt(data.tileCenter(tile.x, tile.y).x, data.tileCenter(tile.x, tile.y).y);
+    this.flashTile(surface.x, surface.y);
+    this.floatText(surface.x, surface.y - 12, `+1 ${materialName(result.material)}`, MATERIAL_COLORS[result.material]);
+    this.updateMaterialHud();
+  }
+
+  private placeAt(worldX: number, worldY: number) {
+    const data = this.worldData;
+    if (!data) return;
+    const bag = getMaterials();
+    const material = BUILD_MATERIALS.find((id) => (bag[id] ?? 0) > 0);
+    if (!material) { this.floatText(this.player.x, this.player.y - 34, '没有可用建材', '#ff9c7a'); return; }
+    const tile = this.pickTile(worldX, worldY);
+    const surface = data.surfaceWorld(tile.x, tile.y);
+    if (Phaser.Math.Distance.Between(this.player.x, this.player.y, surface.x, surface.y) > DIG_REACH) {
+      this.floatText(surface.x, surface.y, '超出范围', '#8795a8'); return;
+    }
+    if (!data.fill(tile.x, tile.y)) { this.floatText(surface.x, surface.y, '这里放不下', '#8795a8'); return; }
+    addMaterial(material, -1);
+    this.worldRenderer?.rebuildAt(data.tileCenter(tile.x, tile.y).x, data.tileCenter(tile.x, tile.y).y);
+    this.flashTile(surface.x, surface.y, 0xffe0aa);
+    this.floatText(surface.x, surface.y - 12, `-1 ${materialName(material)}`, MATERIAL_COLORS[material]);
+    this.updateMaterialHud();
+  }
+
+  private interactWithPoi(poi: Poi) {
+    const data = this.worldData;
+    if (!data) return;
+    const spot = data.surfaceWorld(poi.tileX, poi.tileY);
+    if (poi.kind === 'camp') {
+      // Supplies are guaranteed, but looting wakes whatever still guards the camp.
+      this.spawnGearDrop(spot.x + 34, spot.y - 6, undefined, true);
+      this.spawnCoreDrop(spot.x - 34, spot.y - 6);
+      const guards = Phaser.Math.Between(2, 3);
+      for (let i = 0; i < guards; i++) {
+        const spawn = this.findOpenAt(spot.x + Phaser.Math.Between(-90, 90), spot.y + Phaser.Math.Between(-70, 70), 58);
+        this.spawnEnemy(i === 0 ? 'brute' : 'stalker', spawn.x, spawn.y);
+      }
+      this.poiLayer?.markCleared(poi);
+      this.floatText(spot.x, spot.y - 44, '搜出补给 · 守卫被惊动', '#ffd08b');
+      return;
+    }
+    if (poi.kind === 'shrine') {
+      const progress = getCharacterProgress();
+      progress.statPoints += 1;
+      saveCharacterProgress(progress);
+      this.poiLayer?.markCleared(poi);
+      this.updateCharacterProgressHud();
+      this.floatText(spot.x, spot.y - 44, '石碑加持 · 属性点 +1', '#a9e1ff');
+      return;
+    }
+    if (poi.kind === 'boss') {
+      // Dens are fought in order, so their index doubles as the difficulty tier.
+      const order = data.getPois().filter((entry) => entry.kind === 'boss').findIndex((entry) => entry.id === poi.id);
+      const required = BOSS_RATING[Math.max(0, order)] ?? BOSS_RATING[BOSS_RATING.length - 1];
+      const rating = this.combatRating();
+      if (rating < required) {
+        this.floatText(spot.x, spot.y - 44, `战力不足 ${rating} / ${required}`, '#ff9c7a');
+        return;
+      }
+      this.bossPoiId = poi.id;
+      this.spawnBoss(spot.x, spot.y - 70, 3 + Math.max(0, order));
+      this.floatText(spot.x, spot.y - 60, '守卫苏醒！', '#ff8a6a');
+      const status = document.querySelector<HTMLElement>('#status');
+      if (status) status.textContent = '守卫战 · 躲开红色预警，抓住间隙输出';
+    }
+  }
+
+  /** Called once the guardian summoned by a den is gone. */
+  private completePoiBoss(id: number) {
+    this.bossPoiId = undefined;
+    const data = this.worldData;
+    const poi = data?.poiAt(id);
+    if (!data || !poi) return;
+    this.poiLayer?.markCleared(poi);
+    const spot = data.surfaceWorld(poi.tileX, poi.tileY);
+    this.spawnGearDrop(spot.x + 40, spot.y - 8, undefined, true);
+    this.spawnGearDrop(spot.x - 40, spot.y - 8, undefined, true);
+    this.spawnCoreDrop(spot.x, spot.y - 34);
+    this.spawnCoreDrop(spot.x + 28, spot.y - 22);
+    this.spawnCoreDrop(spot.x - 28, spot.y - 22);
+    const progress = getCharacterProgress();
+    progress.statPoints += 2;
+    saveCharacterProgress(progress);
+    this.updateCharacterProgressHud();
+    this.floatText(spot.x, spot.y - 62, '守卫已击败 · 前方区域解锁', '#ffd08b');
+    const status = document.querySelector<HTMLElement>('#status');
+    if (status) status.textContent = '守卫已击败 · 继续向右推进';
+  }
+
+  private flashTile(x: number, y: number, color = 0xffffff) {
+    const flash = this.add.rectangle(x, y, TILE_SIZE, TILE_HEIGHT, color, .45).setDepth(3.6);
+    this.tweens.add({ targets: flash, alpha: 0, duration: 220, onComplete: () => flash.destroy() });
+  }
+
+  private floatText(x: number, y: number, label: string, color: string) {
+    const text = this.add.text(x, y, label, { fontFamily: 'Microsoft YaHei,sans-serif', fontSize: '12px', color })
+      .setOrigin(.5).setDepth(6);
+    this.tweens.add({ targets: text, y: y - 28, alpha: 0, duration: 640, onComplete: () => text.destroy() });
+  }
+
+  private updateMaterialHud() {
+    if (!this.materialText) return;
+    const bag = getMaterials();
+    const parts = (Object.keys(bag) as MaterialId[]).filter((id) => (bag[id] ?? 0) > 0)
+      .map((id) => `${materialName(id)} ${bag[id]}`);
+    this.materialText.setText(parts.length ? parts.join('   ') : '材料：无  ·  右键挖掘  ·  R 放置方块');
+  }
+
+  /** Explains what a landmark needs before the player can use it. */
+  private poiHintText() {
+    const poi = this.nearPoi;
+    const data = this.worldData;
+    if (!poi || !data) return '';
+    if (!data.isPoiUnlocked(poi)) return '先击败前一个守卫才能挑战';
+    if (poi.kind !== 'boss') return `E  ${poiLabel(poi.kind)}`;
+    const order = data.getPois().filter((entry) => entry.kind === 'boss').findIndex((entry) => entry.id === poi.id);
+    const required = BOSS_RATING[Math.max(0, order)] ?? BOSS_RATING[BOSS_RATING.length - 1];
+    const rating = this.combatRating();
+    return rating < required
+      ? `守卫巢穴 · 战力不足 ${rating} / ${required}`
+      : `E  挑战守卫  ·  战力 ${rating} / ${required}`;
+  }
+
+  /** Rough power score: gear, upgrades and levels. Shown in the HUD and gated by dens. */
+  private combatRating() {
+    const weapon = getEquippedItem('weapon');
+    const armor = getEquippedItem('armor');
+    const progress = getCharacterProgress();
+    const gear = (weapon?.attackBonus ?? 0) * 2 + (armor?.defense ?? 0) * 2;
+    const upgrades = (weapon?.upgradeLevel ?? 0) + (armor?.upgradeLevel ?? 0);
+    return Math.round(gear + upgrades * 2 + progress.level * 2);
+  }
+
+  /** Threat level: rises with how far right the player is and guardians defeated. */
+  private wildernessTier() {
+    if (!this.worldData) return Math.floor((this.room - 1) / 3);
+    const progress = Phaser.Math.Clamp(this.player.x / WORLD_W, 0, 1);
+    return Math.floor(progress * 4) + this.worldData.clearedBossCount() * 2;
+  }
+
+  /** Dying costs a share of carried materials and cores, never gear or levels. */
+  private applyDeathPenalty() {
+    const bag = getMaterials();
+    let materials = 0;
+    (Object.keys(bag) as MaterialId[]).forEach((id) => {
+      const loss = Math.floor((bag[id] ?? 0) * .3);
+      if (loss > 0) { addMaterial(id, -loss); materials += loss; }
+    });
+    const cores = getCoreCount();
+    const lostCores = Math.floor(cores * .25);
+    if (lostCores > 0) setCoreCount(cores - lostCores);
+    return { materials, cores: lostCores };
+  }
+
+  /** Walkable actors share the props' depth band so they sort by their screen row. */
+  private depthAtFoot(footY: number) {
+    return 2 + Phaser.Math.Clamp(footY / WORLD_H, 0, 1) * .5;
+  }
+
+  private sortDepths() {
+    this.player.setDepth(this.depthAtFoot(this.player.y + this.player.displayHeight / 2));
+    this.pet.setDepth(this.depthAtFoot(this.pet.y + this.pet.displayHeight / 2));
+    this.enemies.getChildren().forEach((child) => {
+      const enemy = child as Phaser.Physics.Arcade.Sprite;
+      if (!enemy.active) return;
+      enemy.setDepth(this.depthAtFoot(enemy.y + enemy.displayHeight / 2));
+      // Actors are drawn facing right, so flip towards the hero.
+      enemy.setFlipX(this.player.x < enemy.x);
+    });
+  }
+
+  /** Art actors are taller than the placeholder circles; keep the hitbox at the feet. */
+  private actorCircle(sprite: Phaser.Physics.Arcade.Sprite, radius: number, usingArt: boolean) {
+    if (!usingArt) { sprite.setCircle(radius); return; }
+    sprite.setCircle(radius, sprite.width / 2 - radius, sprite.height * .72 - radius);
+  }
+
   update(_time: number, delta: number) {
     const dt = Math.min(delta, 32);
     const left = this.keys.A.isDown || this.cursors.left.isDown;
@@ -847,8 +1156,18 @@ class CombatScene extends Phaser.Scene {
     const agilityBonus = 1 + Math.min(.3, getCharacterProgress().attributes.agility * .02);
     const speed = (this.dashTimer > 0 ? 570 : 205 * (this.swiftStep ? 1.12 : 1)) * agilityBonus;
     this.player.setVelocity(move.x * speed, move.y * speed);
+    if (move.x !== 0) this.player.setFlipX(move.x < 0);
+    this.sortDepths();
     if (this.worldRenderer?.update(this.player.x, this.player.y)) {
       this.updateLabels(); this.drawMiniMap();
+    }
+    this.nearPoi = this.worldData ? this.poiLayer?.update(this.player.x, this.player.y) : undefined;
+    if (this.bossPoiId !== undefined) {
+      const guardianAlive = this.enemies.getChildren().some((child) => {
+        const enemy = child as Phaser.Physics.Arcade.Sprite;
+        return enemy.active && enemy.getData('kind') === 'boss';
+      });
+      if (!guardianAlive) this.completePoiBoss(this.bossPoiId);
     }
     this.dashTimer = Math.max(0, this.dashTimer - dt);
     this.attackTimer = Math.max(0, this.attackTimer - dt);
@@ -861,6 +1180,7 @@ class CombatScene extends Phaser.Scene {
     if (Phaser.Input.Keyboard.JustDown(this.keys.Q)) this.castActiveSkill();
     if (Phaser.Input.Keyboard.JustDown(this.keys.E)) {
       if (this.lootPhase) this.finishLootPhase();
+      else if (this.nearPoi && this.worldData?.isPoiUnlocked(this.nearPoi)) this.interactWithPoi(this.nearPoi);
       else if (this.roomFeatureKind) {
         const feature = this.roomFeature;
         if (feature && Phaser.Math.Distance.Between(this.player.x, this.player.y, feature.x, feature.y) <= 82) this.interactWithRoomFeature();
@@ -872,6 +1192,12 @@ class CombatScene extends Phaser.Scene {
     this.checkpointTimer = Math.max(0, this.checkpointTimer - dt);
     if (this.checkpointTimer <= 0) { this.checkpointTimer = 2500; if (!this.lootPhase) this.saveCurrentCheckpoint(); }
     const pointer = this.input.activePointer;
+    this.digTimer = Math.max(0, this.digTimer - dt);
+    if (this.worldData && pointer.rightButtonDown() && this.digTimer <= 0) {
+      this.digTimer = DIG_COOLDOWN;
+      this.digAt(pointer.worldX, pointer.worldY);
+    }
+    if (this.worldData && Phaser.Input.Keyboard.JustDown(this.keys.R)) this.placeAt(pointer.worldX, pointer.worldY);
     if (this.attackHeld && this.attackTimer <= 0) this.attack(pointer.worldX, pointer.worldY);
     this.movePet(); this.moveEnemies(dt); this.updateAutomaticSkill();
     if (this.worldData) {
@@ -883,6 +1209,9 @@ class CombatScene extends Phaser.Scene {
     }
     if (this.lootPhase) {
       this.interactionHint.setText('区域已肃清 · 收集掉落物，按 E 查看路线（技能书会自动收好）');
+      this.interactionHint.setVisible(true);
+    } else if (this.nearPoi) {
+      this.interactionHint.setText(this.poiHintText());
       this.interactionHint.setVisible(true);
     } else if (this.roomFeatureKind && this.roomFeature?.active) {
       const near = Phaser.Math.Distance.Between(this.player.x, this.player.y, this.roomFeature.x, this.roomFeature.y) <= 110;
@@ -1248,7 +1577,10 @@ class CombatScene extends Phaser.Scene {
     enemy.setVelocity(Math.cos(angle) * knockback, Math.sin(angle) * knockback);
     if (hp <= 0) {
       const isBoss = enemy.getData('kind') === 'boss';
-      this.grantExperience(isBoss ? 120 + this.room * 10 : 16 + this.room * 2);
+      // Rewards follow the threat level, not the dungeon room, so the open world
+      // keeps pace with the player instead of paying out tier-one values forever.
+      const tier = this.wildernessTier();
+      this.grantExperience(isBoss ? 120 + tier * 16 : 16 + tier * 4);
       if (isBoss) {
         this.clearEnemyWarnings(enemy);
         this.tryDropPetSkillBook(enemy.x - 16, enemy.y, true);
@@ -1301,8 +1633,9 @@ class CombatScene extends Phaser.Scene {
       { type: 'sword' as const, name: '裂锋短剑' }, { type: 'spear' as const, name: '巡猎长枪' }, { type: 'staff' as const, name: '星火法杖' },
     ];
     const selectedWeapon = Phaser.Utils.Array.GetRandom(weaponOptions);
-    const attackBonus = slot === 'weapon' ? (rarity === 'epic' ? 3 : rarity === 'rare' ? 2 : 1) + Math.floor(this.room / 5) : 0;
-    const defense = slot === 'armor' ? (rarity === 'epic' ? 3 : rarity === 'rare' ? 2 : 1) + Math.floor(this.room / 6) : 0;
+    const tier = this.wildernessTier();
+    const attackBonus = slot === 'weapon' ? (rarity === 'epic' ? 3 : rarity === 'rare' ? 2 : 1) + Math.floor(tier / 3) : 0;
+    const defense = slot === 'armor' ? (rarity === 'epic' ? 3 : rarity === 'rare' ? 2 : 1) + Math.floor(tier / 4) : 0;
     const item: EquipmentItem = {
       id: `gear-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       name: slot === 'weapon' ? selectedWeapon.name : '边境守卫护甲', slot, rarity,
@@ -1456,7 +1789,18 @@ class CombatScene extends Phaser.Scene {
     const fill = document.querySelector<HTMLElement>('#health'); const label = document.querySelector<HTMLElement>('#health-label');
     if (fill) fill.style.width = `${this.hp}%`; if (label) label.textContent = `${this.hp} / 100`;
     this.cameras.main.shake(90, .003);
-    if (this.hp <= 0) { this.saveCurrentCheckpoint(); this.showResult('远征中断', `你抵达了 ${formatStage(this.room)} 的第 ${this.dungeon.currentRoom + 1} 个房间，击败了 ${this.kills} 个敌人。`, false); }
+    if (this.hp <= 0) {
+      const penalty = this.applyDeathPenalty();
+      const loss = penalty.materials + penalty.cores > 0
+        ? `失去了 ${penalty.materials} 份材料和 ${penalty.cores} 枚晶片。`
+        : '没有携带材料，损失轻微。';
+      // Revive at the hub: the saved run must never resume at zero health.
+      this.hp = 100;
+      this.updateHealthHud();
+      this.saveCurrentCheckpoint();
+      if (this.worldData) this.showResult('探索中断', `${loss}提升战力后再次出发。`, false);
+      else this.showResult('远征中断', `你抵达了 ${formatStage(this.room)} 的第 ${this.dungeon.currentRoom + 1} 个房间，击败了 ${this.kills} 个敌人。${loss}`, false);
+    }
   }
 
   private updatePetSkillHud() {
@@ -1500,7 +1844,12 @@ class CombatScene extends Phaser.Scene {
 
   private saveCurrentCheckpoint() {
     if (this.worldData) {
-      saveWorldSave({ seed: this.worldData.seed, explored: this.worldData.exploredKeys(), playerX: this.player.x, playerY: this.player.y, hp: this.hp, tileSize: TILE_SIZE });
+      saveWorldSave({
+        seed: this.worldData.seed, explored: this.worldData.exploredBitmap(),
+        playerX: this.player.x, playerY: this.player.y, hp: this.hp,
+        dug: this.worldData.dugEntries(), cleared: this.worldData.clearedEntries(),
+        poi: this.worldData.poiEntries(),
+      });
       return;
     }
     const progress = getExpeditionProgress();
@@ -1579,8 +1928,9 @@ class CombatScene extends Phaser.Scene {
   private updateLabels() {
     if (this.worldData) {
       const tile = this.worldData.toTile(this.player.x, this.player.y);
-      this.roomText.setText(`WORLD  ${tile.x + 1} · ${tile.y + 1}`);
-      this.roomNameText.setText(biomeName(this.worldData.biomeAtTile(tile.x, tile.y)));
+      const info = this.worldData.tileAt(tile.x, tile.y);
+      this.roomText.setText(`WORLD  ${tile.x + 1} · ${tile.y + 1}   ·   战力 ${this.combatRating()}`);
+      this.roomNameText.setText(`${biomeName(info.biome)}${info.ore ? `  ·  ${oreName(info.ore)}` : ''}   ·   威胁 ${this.wildernessTier() + 1}`);
       this.dashText.setText(this.dashReady ? 'SPACE  /  DASH READY' : 'DASH RECHARGING');
       return;
     }
@@ -1589,13 +1939,32 @@ class CombatScene extends Phaser.Scene {
   }
 }
 
-const game = new Phaser.Game({
-  type: Phaser.AUTO, width: W, height: H, parent: 'game', backgroundColor: '#171e28',
-  render: { antialias: true, pixelArt: false },
-  physics: { default: 'arcade', arcade: { debug: false } },
-  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
-  scene: [CombatScene],
-});
+// The tile manifest is probed before boot so missing art never triggers 404 loads.
+let game!: Phaser.Game;
+function bootGame() {
+  game = new Phaser.Game({
+    type: Phaser.AUTO, width: W, height: H, parent: 'game', backgroundColor: '#171e28',
+    render: { antialias: true, pixelArt: false },
+    physics: { default: 'arcade', arcade: { debug: false } },
+    scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+    scene: [CombatScene, DefenseScene],
+  });
+  // Listeners have to be attached here: the game does not exist while this module
+  // is still evaluating, so top level bindings would throw.
+  game.events.on('expedition:return', () => {
+    game.scale.stopListeners();
+    combatScreen.classList.add('hidden'); hubScreen.classList.remove('hidden');
+    game.loop.sleep();
+    refreshWorldUI();
+  });
+  game.events.on('defense:ended', (result: { seconds: number; threat: number; kills: number; best: number }) => {
+    showDefenseResult(result);
+  });
+  game.events.on('defense:boon', (choices: string[]) => {
+    showBoonChoice(choices as BoonId[]);
+  });
+}
+void loadTileManifest().then(bootGame);
 
 const hubScreen = document.querySelector<HTMLElement>('#hub-screen')!;
 const combatScreen = document.querySelector<HTMLElement>('#combat-screen')!;
@@ -1609,7 +1978,7 @@ let characterPageTab: 'overview' | 'skills' | 'equipment' = 'overview';
 type NpcId = 'quartermaster' | 'trainer' | 'petkeeper' | 'guide';
 type DialogChoice = { label: string; action: string; hint?: string };
 const npcProfiles: Record<NpcId, { role: string; name: string; avatar: string; text: string; options: DialogChoice[] }> = {
-  quartermaster: { role: 'OUTPOST QUARTERMASTER', name: '军需官·老霍', avatar: '⚒', text: '装备、武器和强化都可以在人物信息页统一整备。出发前记得检查你的配置。', options: [
+  quartermaster: { role: 'OUTPOST QUARTERMASTER', name: '军需官·老霍', avatar: '⚒', text: '装备、武器和强化都可以在人物信息页统一整备。挖到的矿石能在材料页熔炼成首领晶片。', options: [
     { label: '打开人物信息', action: 'character:open', hint: '装备 · 属性 · 技能' }, { label: '我再看看', action: 'close' },
   ] },
   trainer: { role: 'VETERAN TRAINER', name: '老兵教官·岑', avatar: '✦', text: '人物属性和技能配置已经整合进人物信息页。职业之间的跨系学习规则，可以向我了解。', options: [
@@ -1851,10 +2220,22 @@ function renderCharacterPage(message?: string) {
       }).join('');
       const gearMessage = message ? '<p class="profile-message">' + message + '</p>' : '';
       const emptyGearMessage = '<p class="profile-note">背包暂时没有掉落装备，进入副本击败敌人寻找战利品。</p>';
+      const bag = getMaterials();
+      const held = (Object.keys(bag) as MaterialId[]).filter((id) => (bag[id] ?? 0) > 0);
+      const materialRows = held.map((id) => '<article class="profile-row"><div><strong>' + materialName(id) + '</strong><small>'
+        + (BUILD_MATERIALS.includes(id) ? '建材 · 世界中按 R 放置' : '矿石 · 可熔炼为晶片') + '</small></div><span class="skill-state">' + bag[id] + '</span></article>').join('');
+      const smeltButtons = SMELT_RECIPES.map((recipe) => {
+        const owned = bag[recipe.ore] ?? 0;
+        return '<button data-character-action="smelt:' + recipe.ore + '" ' + (owned < recipe.amount ? 'disabled' : '') + '>'
+          + materialName(recipe.ore) + ' ×' + recipe.amount + ' → 1 晶片</button>';
+      }).join('');
+      const materialSection = '<div class="profile-section"><div class="profile-section-heading"><div><span class="eyebrow">MATERIALS</span><h3>材料与熔炼</h3></div><small>挖掘获得 · 晶片 ' + getCoreCount() + '</small></div>'
+        + (materialRows ? '<div class="gear-list">' + materialRows + '</div>' : '<p class="profile-note">还没有材料。在世界中按住右键挖掘地面与矿脉即可获得。</p>')
+        + '<div class="gear-actions">' + smeltButtons + '</div></div>';
       characterContent.innerHTML = '<div class="profile-section"><span class="eyebrow">WEAPON STYLE</span><h3>出战武器</h3><div class="profile-weapons">' + weaponCards + '</div></div>' +
       '<div class="profile-section"><div class="profile-section-heading"><div><span class="eyebrow">EQUIPMENT</span><h3>装备与强化</h3></div><small>首领晶片：' + getCoreCount() + '</small></div>' + gearMessage +
       '<div class="equipped-slots"><article>武器槽<strong>' + (equippedWeapon ? equippedWeapon.name + ' +' + equippedWeapon.upgradeLevel : '未装备') + '</strong><small>' + (equippedWeapon ? describeEquipment(equippedWeapon) : '从下方背包装备武器') + '</small></article><article>护甲槽<strong>' + (equippedArmor ? equippedArmor.name + ' +' + equippedArmor.upgradeLevel : '未装备') + '</strong><small>' + (equippedArmor ? describeEquipment(equippedArmor) : '从下方背包装备护甲') + '</small></article></div>' +
-      (state.items.length ? '<div class="gear-list">' + gearRows + '</div>' : emptyGearMessage) + '</div>';
+      (state.items.length ? '<div class="gear-list">' + gearRows + '</div>' : emptyGearMessage) + '</div>' + materialSection;
   }
 }
 
@@ -1893,22 +2274,98 @@ function handleCharacterPageAction(action: string) {
     item.description = describeEquipment(item); saveEquipmentState(state);
     game.events.emit('weapon:select', document.querySelector<HTMLButtonElement>('[data-weapon].selected')?.dataset.weapon ?? 'sword');
     renderCharacterPage(`${item.name}强化至 +${item.upgradeLevel}。`);
+  } else if (action.startsWith('smelt:')) {
+    const ore = action.slice('smelt:'.length) as MaterialId;
+    const recipe = SMELT_RECIPES.find((entry) => entry.ore === ore);
+    const bag = getMaterials();
+    if (!recipe || (bag[ore] ?? 0) < recipe.amount) { renderCharacterPage('矿石不足，无法熔炼。'); return; }
+    addMaterial(ore, -recipe.amount);
+    setCoreCount(getCoreCount() + 1);
+    renderCharacterPage(`熔炼完成：${materialName(ore)} ×${recipe.amount} → 首领晶片 +1，当前共 ${getCoreCount()} 枚。`);
   }
 }
 
+function clock(totalSeconds: number) {
+  return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, '0')}`;
+}
+
+function loadDefenseBest() {
+  try { return Number(localStorage.getItem(BEST_KEY)) || 0; } catch { return 0; }
+}
+
 function refreshWorldUI() {
-  const save = loadWorldSave();
+  const best = loadDefenseBest();
   const summary = document.querySelector<HTMLElement>('#world-summary');
   const continueLabel = document.querySelector<HTMLElement>('#continue-stage-label');
   const embark = document.querySelector<HTMLButtonElement>('#embark');
-  if (summary) summary.textContent = save ? `已探索 ${save.explored.length} 格 · 种子 ${save.seed}` : '尚未生成世界';
-  if (continueLabel) continueLabel.textContent = save ? '回到上次位置 →' : '进入世界 →';
-  if (embark) embark.firstChild!.textContent = save ? '继续探索 ' : '开始探索 ';
+  if (summary) summary.textContent = best ? `最佳存活 ${clock(best)} · 守住核心，撑过一波波怪物` : '守住核心，撑过一波波怪物';
+  if (continueLabel) continueLabel.textContent = best ? '刷新纪录 →' : '首战 →';
+  if (embark?.firstChild) embark.firstChild.textContent = '进入防守战 ';
+}
+
+function showBoonChoice(choices: BoonId[]) {
+  const overlay = document.querySelector<HTMLElement>('#overlay')!;
+  const title = document.querySelector<HTMLElement>('#result-title')!;
+  const text = document.querySelector<HTMLElement>('#result-text')!;
+  const routes = document.querySelector<HTMLElement>('#route-options')!;
+  document.querySelector<HTMLButtonElement>('#continue')!.classList.add('hidden');
+  document.querySelector<HTMLButtonElement>('#return-hub')!.classList.add('hidden');
+  title.textContent = '威胁升级 · 选择一项增益';
+  text.textContent = '选完后继续防守。同类增益可以重复叠加。';
+  routes.replaceChildren();
+  routes.classList.remove('hidden');
+  choices.forEach((id) => {
+    const boon = BOONS.find((entry) => entry.id === id)!;
+    const button = document.createElement('button');
+    button.textContent = `${boon.name} — ${boon.description}`;
+    button.onclick = () => {
+      overlay.classList.add('hidden');
+      game.events.emit('defense:boon:picked', id);
+    };
+    routes.append(button);
+  });
+  overlay.classList.remove('hidden');
+}
+
+function startDefense() {
+  hubScreen.classList.add('hidden'); combatScreen.classList.remove('hidden');
+  dialog.classList.add('hidden'); characterPage.classList.add('hidden');
+  game.scale.startListeners(); game.scale.refresh(); game.loop.wake();
+  game.scene.stop('combat');
+  game.scene.start('defense');
+}
+
+function showDefenseResult(result: { seconds: number; threat: number; kills: number; best: number }) {
+  const overlay = document.querySelector<HTMLElement>('#overlay')!;
+  const title = document.querySelector<HTMLElement>('#result-title')!;
+  const text = document.querySelector<HTMLElement>('#result-text')!;
+  const again = document.querySelector<HTMLButtonElement>('#continue')!;
+  const back = document.querySelector<HTMLButtonElement>('#return-hub')!;
+  const routes = document.querySelector<HTMLElement>('#route-options');
+  if (routes) { routes.replaceChildren(); routes.classList.add('hidden'); }
+  title.textContent = '核心被摧毁';
+  text.textContent = `存活 ${clock(result.seconds)}　威胁等级 ${result.threat}　击杀 ${result.kills}　最好成绩 ${clock(result.best)}`;
+  again.classList.remove('hidden');
+  again.textContent = '再来一局';
+  again.onclick = () => { overlay.classList.add('hidden'); game.scene.stop('defense'); game.scene.start('defense'); };
+  back.textContent = '返回营地';
+  back.onclick = () => {
+    overlay.classList.add('hidden');
+    game.scene.stop('defense');
+    game.scale.stopListeners();
+    combatScreen.classList.add('hidden'); hubScreen.classList.remove('hidden');
+    game.loop.sleep();
+    refreshWorldUI();
+  };
+  overlay.classList.remove('hidden');
 }
 
 function startWorld(resume = false) {
   hubScreen.classList.add('hidden'); combatScreen.classList.remove('hidden'); dialog.classList.add('hidden');
   characterPage.classList.add('hidden');
+  // The scale listeners and the loop are parked while the canvas is hidden, so the
+  // ScaleManager never measures a zero-sized parent and loops on resize.
+  game.scale.startListeners(); game.scale.refresh(); game.loop.wake();
   if (resume) game.events.emit('world:resume'); else game.events.emit('world:begin');
 }
 
@@ -1933,7 +2390,7 @@ characterPage.addEventListener('click', (event) => {
 document.querySelector<HTMLButtonElement>('#close-dialog')!.addEventListener('click', () => dialog.classList.add('hidden'));
 dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.classList.add('hidden'); });
 document.querySelector<HTMLButtonElement>('#embark')!.addEventListener('click', () => {
-  startWorld(Boolean(loadWorldSave()));
+  startDefense();
 });
 document.querySelector<HTMLButtonElement>('#new-expedition')!.addEventListener('click', () => {
   if (loadWorldSave() && !window.confirm('生成新世界会覆盖当前世界进度，确定继续吗？')) return;
@@ -1942,8 +2399,5 @@ document.querySelector<HTMLButtonElement>('#new-expedition')!.addEventListener('
 document.querySelector<HTMLButtonElement>('#leave-world')!.addEventListener('click', () => {
   game.events.emit('world:leave');
   game.events.emit('expedition:return');
-});
-game.events.on('expedition:return', () => {
-  combatScreen.classList.add('hidden'); hubScreen.classList.remove('hidden'); refreshWorldUI();
 });
 refreshWorldUI();
