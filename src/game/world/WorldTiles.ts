@@ -35,9 +35,13 @@ export async function loadTileManifest(): Promise<boolean> {
   return false;
 }
 
-/** Queues every manifest entry that actually resolved into a texture. */
+/** Queues every manifest entry that has not been loaded by another scene yet. */
 export function queueTileImages(scene: Phaser.Scene) {
-  Object.keys(manifest).forEach((id) => scene.load.image(textureKey(id), TILE_DIR + manifest[id]));
+  Object.keys(manifest).forEach((id) => {
+    const key = textureKey(id);
+    if (scene.textures.exists(key)) return;
+    scene.load.image(key, TILE_DIR + manifest[id]);
+  });
 }
 
 /**

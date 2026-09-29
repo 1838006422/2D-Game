@@ -6,6 +6,7 @@ import {
   MIN_SPAWN_INTERVAL, NODES, NodeKind, PET_LEASH, THREAT_INTERVAL, TILE,
 } from './DefenseConfig';
 import { DefenseWorld } from './DefenseWorld';
+import { actorTexture, queueTileImages, registerTiles } from '../world/WorldTiles';
 
 type BuildInstance = { kind: BuildKind; tileX: number; tileY: number; hp: number; object: Phaser.GameObjects.Rectangle; readyAt: number };
 type NodeInstance = { kind: NodeKind; hp: number; object: Phaser.GameObjects.GameObject; x: number; y: number };
@@ -15,6 +16,12 @@ export const BEST_KEY = 'defense-best-run';
 const PLAYER_SPEED = 210;
 const ATTACK_COOLDOWN = 300;
 const ATTACK_RANGE = 78;
+
+/**
+ * Defence waves reuse the adventure art: the kinds differ in stats, not in
+ * silhouette, so grunts and runners borrow the stalker sprite.
+ */
+const ENEMY_ART: Record<EnemyKind, string> = { grunt: 'stalker', runner: 'stalker', brute: 'brute', elite: 'caster' };
 
 /**
  * Endless survival defence: harvest the arena, build walls and towers around the
@@ -57,7 +64,14 @@ export class DefenseScene extends Phaser.Scene {
 
   constructor() { super('defense'); }
 
+  preload() {
+    // Shared with the adventure scene: re-queuing is cheap and keeps the defence
+    // mode dressed even when it starts without a combat run first.
+    queueTileImages(this);
+  }
+
   create() {
+    registerTiles(this);
     this.createTextures();
     this.world = new DefenseWorld(Math.floor(Math.random() * 0x7fffffff));
     this.world.render(this);
@@ -69,9 +83,16 @@ export class DefenseScene extends Phaser.Scene {
     this.createCore();
     this.createNodes();
 
-    this.player = this.physics.add.sprite(MAP_WIDTH / 2, MAP_HEIGHT / 2 + 90, 'player').setDepth(3)
-      .setCircle(14).setCollideWorldBounds(true);
-    this.pet = this.physics.add.sprite(MAP_WIDTH / 2 - 50, MAP_HEIGHT / 2 + 90, 'pet').setDepth(3).setCircle(9);
+    // Art sprites are drawn for the adventure camera, so they are trimmed a little
+    // to sit at the same scale as the buildings around them.
+    const playerArt = actorTexture('player');
+    this.player = this.physics.add.sprite(MAP_WIDTH / 2, MAP_HEIGHT / 2 + 90, playerArt ?? 'player').setDepth(3)
+      .setScale(playerArt ? .85 : 1).setCollideWorldBounds(true);
+    this.actorCircle(this.player, 14, Boolean(playerArt));
+    const petArt = actorTexture('pet');
+    this.pet = this.physics.add.sprite(MAP_WIDTH / 2 - 50, MAP_HEIGHT / 2 + 90, petArt ?? 'pet').setDepth(3)
+      .setScale(petArt ? .9 : 1);
+    this.actorCircle(this.pet, 9, Boolean(petArt));
     this.cameras.main.startFollow(this.player, true, .12, .12);
 
     this.physics.add.collider(this.player, this.structures);
@@ -106,6 +127,12 @@ export class DefenseScene extends Phaser.Scene {
       graphics.generateTexture(key, radius * 2, radius * 2); graphics.destroy();
     };
     make('player', 0x91e1c4, 16); make('enemy', 0xe77d70, 14); make('pet', 0xa9e9dc, 11);
+  }
+
+  /** Art actors are taller than the placeholder circles; keep the hitbox at the feet. */
+  private actorCircle(sprite: Phaser.Physics.Arcade.Sprite, radius: number, usingArt: boolean) {
+    if (!usingArt) { sprite.setCircle(radius); return; }
+    sprite.setCircle(radius, Math.max(0, sprite.width / 2 - radius), Math.max(0, sprite.height * .72 - radius));
   }
 
   private createCore() {
@@ -328,9 +355,15 @@ export class DefenseScene extends Phaser.Scene {
       if (this.world.isBuildable(Math.floor(x / TILE), Math.floor(y / TILE))) break;
     }
     const scale = 1 + this.threat * .06;
-    const enemy = this.physics.add.sprite(x, y, 'enemy').setDepth(2.2).setCircle(def.radius)
-      .setTint(def.color).setScale(scale)
-      .setData({ kind, hp: Math.round(def.hp * (1 + this.threat * .28)), damage: def.damage, speed: def.speed, slowUntil: 0 });
+    const art = actorTexture(ENEMY_ART[kind]);
+    const enemy = this.physics.add.sprite(x, y, art ?? 'enemy').setDepth(2.2);
+    // Art sprites are drawn taller than the placeholder circles, so they are scaled
+    // back to roughly the silhouette the circle had.
+    const baseScale = art ? (def.radius * 2.2) / enemy.height : 1;
+    enemy.setScale(baseScale * scale)
+      .setTint(art ? 0xffffff : def.color)
+      .setData({ kind, hp: Math.round(def.hp * (1 + this.threat * .28)), damage: def.damage, speed: def.speed, slowUntil: 0, usesArt: Boolean(art) });
+    this.actorCircle(enemy, def.radius, Boolean(art));
     enemy.setCollideWorldBounds(true);
     this.enemies.add(enemy);
   }
@@ -345,6 +378,8 @@ export class DefenseScene extends Phaser.Scene {
       // Head for the core; anything blocking is handled by the collider.
       const angle = Phaser.Math.Angle.Between(enemy.x, enemy.y, core.x, core.y);
       enemy.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+      // Actors are drawn facing right, so flip them towards the core they walk at.
+      if (enemy.getData('usesArt')) enemy.setFlipX(core.x < enemy.x);
 
       if (Phaser.Math.Distance.Between(enemy.x, enemy.y, core.x, core.y) < 52) {
         const damage = (enemy.getData('damage') as number) * dt / 1000;
