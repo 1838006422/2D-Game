@@ -9,6 +9,10 @@ export const MAP_WIDTH = MAP_COLUMNS * TILE;
 export const MAP_HEIGHT = MAP_ROWS * TILE;
 
 export const CORE_HP = 1000;
+/** Each run alternates between a safe preparation window and a monster assault. */
+export const DAY_DURATION = 70;
+export const NIGHT_DURATION = 60;
+export const CYCLE_DURATION = DAY_DURATION + NIGHT_DURATION;
 /** Clear radius around the core so the first wave is never spawned on top of it. */
 export const CORE_CLEAR_RADIUS = 5;
 
@@ -52,13 +56,19 @@ export const NODES: Record<NodeKind, NodeDef> = {
   crystalVein: { name: '晶簇', hp: 6, yield: 'crystal', amount: 3, color: 0x9b7ce0, radius: 13 },
 };
 
-export type EnemyKind = 'grunt' | 'brute' | 'runner' | 'elite';
-export type EnemyDef = { hp: number; speed: number; damage: number; color: number; radius: number; xp: number };
+export type EnemyKind = 'grunt' | 'brute' | 'runner' | 'elite' | 'boss';
+export type EnemyDef = {
+  hp: number; speed: number; damage: number; color: number; radius: number; xp: number;
+  /** Bosses only: how close the player must come before it wakes up, and how
+   *  often it can slam. Bosses roam instead of walking at the core. */
+  aggroRange?: number; attackCooldown?: number;
+};
 export const ENEMIES: Record<EnemyKind, EnemyDef> = {
   grunt: { hp: 12, speed: 62, damage: 8, color: 0xe77d70, radius: 12, xp: 4 },
   runner: { hp: 8, speed: 104, damage: 6, color: 0xf0c26a, radius: 10, xp: 5 },
   brute: { hp: 38, speed: 40, damage: 18, color: 0xe79b5b, radius: 17, xp: 10 },
   elite: { hp: 120, speed: 52, damage: 26, color: 0xb38bed, radius: 20, xp: 30 },
+  boss: { hp: 900, speed: 58, damage: 30, color: 0xff7ad9, radius: 26, xp: 80, aggroRange: 230, attackCooldown: 1600 },
 };
 
 export type BoonId = 'damage' | 'speed' | 'towerRate' | 'petPower' | 'harvest' | 'coreRepair';
@@ -77,7 +87,7 @@ export const BOONS: Boon[] = [
  * Endless escalation: threat climbs every `THREAT_INTERVAL` seconds and drives
  * spawn rate, enemy health and how many spawn at once.
  */
-export const THREAT_INTERVAL = 30;
+export const THREAT_INTERVAL = CYCLE_DURATION;
 export const BASE_SPAWN_INTERVAL = 2600;
 export const MIN_SPAWN_INTERVAL = 520;
 export const AIRDROP_INTERVAL = 45;
@@ -88,3 +98,13 @@ export const AIRDROP_LIFETIME = 40;
  * base" pressure of airdrops intact.
  */
 export const PET_LEASH = 240;
+/**
+ * Wild bosses: one at a time, roaming far from the core. They are an optional
+ * hunt that pays out books and gear, not part of the wave pressure, so they
+ * never walk at the core and only fight what comes close.
+ */
+export const BOSS_MIN_THREAT = 1;
+export const BOSS_DELAY_MIN = 40_000;
+export const BOSS_DELAY_MAX = 70_000;
+/** Boss loot sits on the ground longer than a normal airdrop. */
+export const BOSS_LOOT_LIFETIME = 120;

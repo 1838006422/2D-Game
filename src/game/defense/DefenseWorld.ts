@@ -27,6 +27,9 @@ export class DefenseWorld {
   readonly tiles: BiomeId[] = [];
   readonly nodes: ResourceNode[] = [];
   readonly coreTile = { x: Math.floor(MAP_COLUMNS / 2), y: Math.floor(MAP_ROWS / 2) };
+  /** Land the player can actually walk to: everything else is across water. */
+  private readonly reachable: boolean[] = [];
+  private landTiles: { x: number; y: number }[] = [];
 
   constructor(readonly seed: number) {
     for (let y = 0; y < MAP_ROWS; y++) {
@@ -40,6 +43,7 @@ export class DefenseWorld {
         this.tiles.push(biome);
       }
     }
+    this.computeReachable();
     this.scatterNodes();
   }
 
@@ -52,6 +56,58 @@ export class DefenseWorld {
   /** Water cannot hold buildings; everything else can. */
   isBuildable(x: number, y: number) { return this.biomeAt(x, y) !== 'water'; }
 
+  /**
+   * Flood fill from the core over land. Water is solid, so anything spawned on
+   * an unreachable shore would never reach the fight (and the player could never
+   * reach it): spawns, drops and roaming all stick to reachable land.
+   */
+  private computeReachable() {
+    const start = this.index(this.coreTile.x, this.coreTile.y);
+    const queue: number[] = [start];
+    this.reachable[start] = true;
+    while (queue.length) {
+      const current = queue.pop()!;
+      const x = current % MAP_COLUMNS; const y = Math.floor(current / MAP_COLUMNS);
+      const neighbours = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+      for (const [dx, dy] of neighbours) {
+        const nx = x + dx; const ny = y + dy;
+        if (!this.inBounds(nx, ny)) continue;
+        const next = this.index(nx, ny);
+        if (this.reachable[next] || this.tiles[next] === 'water') continue;
+        this.reachable[next] = true;
+        queue.push(next);
+      }
+    }
+    this.landTiles = this.reachable
+      .map((ok, index) => (ok ? { x: index % MAP_COLUMNS, y: Math.floor(index / MAP_COLUMNS) } : null))
+      .filter((tile): tile is { x: number; y: number } => tile !== null);
+  }
+
+  isReachable(x: number, y: number) { return this.inBounds(x, y) && this.reachable[this.index(x, y)]; }
+
+  /** A random tile on land the player can walk to. */
+  randomLandTile() { return this.landTiles[Math.floor(Math.random() * this.landTiles.length)]; }
+
+  /**
+   * Water is solid, so the arena needs bodies for it: consecutive water tiles in
+   * a row are merged into one rectangle to keep the physics tree small.
+   */
+  waterBodies() {
+    const bodies: { x: number; y: number; width: number; height: number }[] = [];
+    for (let y = 0; y < MAP_ROWS; y++) {
+      let run = 0;
+      for (let x = 0; x <= MAP_COLUMNS; x++) {
+        const water = x < MAP_COLUMNS && this.biomeAt(x, y) === 'water';
+        if (water) { run++; continue; }
+        if (run > 0) {
+          bodies.push({ x: (x - run) * TILE, y: y * TILE, width: run * TILE, height: TILE });
+          run = 0;
+        }
+      }
+    }
+    return bodies;
+  }
+
   private scatterNodes() {
     const wanted: NodeKind[] = [];
     for (let i = 0; i < 120; i++) wanted.push('tree');
@@ -62,7 +118,8 @@ export class DefenseWorld {
         const x = 2 + Math.floor(hash(this.seed + slot * 31, attempt, 3) * (MAP_COLUMNS - 4));
         const y = 2 + Math.floor(hash(this.seed + slot * 31, attempt, 9) * (MAP_ROWS - 4));
         if (Math.hypot(x - this.coreTile.x, y - this.coreTile.y) < CORE_CLEAR_RADIUS + 1) continue;
-        if (this.biomeAt(x, y) === 'water') continue;
+        // Nodes must sit on land the player can walk to, never across a lake.
+        if (!this.isReachable(x, y)) continue;
         if (this.nodes.some((node) => Math.hypot(node.x - x, node.y - y) < 1.4)) continue;
         this.nodes.push({ id: this.nodes.length, kind, x, y, hp: 0 });
         return;
